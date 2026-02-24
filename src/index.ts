@@ -1,65 +1,223 @@
 'use client'
 
 import React, { createContext, useContext, useEffect, useRef } from 'react'
+import Link from 'next/link'
+import { usePathname } from 'next/navigation'
+
+// ============================================================
+// Typed event schema — augment this interface in your project
+// to get autocomplete and type checking on track() calls.
+//
+// Example (global.d.ts or any .ts file):
+//
+//   declare module '@sparklytics/next' {
+//     interface SparklyticsEvents {
+//       signup_click:      { plan: 'free' | 'pro' | 'enterprise' }
+//       checkout_started:  { cart_value: number; currency: string }
+//       video_played:      { title: string; duration_s: number }
+//     }
+//   }
+//
+// After augmentation, track() will enforce the correct payload
+// for known event names and still accept arbitrary strings for
+// ad-hoc events.
+// ============================================================
+
+// eslint-disable-next-line @typescript-eslint/no-empty-interface
+export interface SparklyticsEvents {}
 
 // ============================================================
 // Types
 // ============================================================
 
 export interface SparklyticsProviderProps {
-  /** Required. The website UUID from your Sparklytics dashboard. */
-  websiteId: string
   /**
-   * Optional. Base URL of your Sparklytics server.
-   * SDK appends /api/collect automatically.
-   * Do NOT pass the full collect URL — that will result in a double path.
-   * Example: "https://analytics.example.com"
-   */
-  /**
-   * Optional. Base URL of your Sparklytics server.
-   * SDK appends /api/collect automatically.
-   * Do NOT pass the full collect URL — that will result in a double path.
-   * Example: "https://analytics.example.com"
+   * Website ID from your Sparklytics dashboard (e.g. `"site_abc123def456"`).
    *
-   * Defaults to '' (same-origin relative path → /api/collect).
-   * Auto-detection from the script's src attribute is deferred — the self-hosted
-   * target (Next.js app on the same origin as the analytics server) does not need it.
+   * Can be omitted when `NEXT_PUBLIC_SPARKLYTICS_WEBSITE_ID` is set in your
+   * Next.js environment — the SDK will read it automatically.
    */
-  endpoint?: string
+  websiteId?: string
+  /**
+   * Base URL of your self-hosted Sparklytics server.
+   * SDK appends `/api/collect` automatically. Trailing slash is safe.
+   *
+   * Can be omitted when `NEXT_PUBLIC_SPARKLYTICS_HOST` is set in your
+   * Next.js environment — the SDK will read it automatically.
+   * Omit entirely for same-origin setups where your app and analytics
+   * server share a domain.
+   *
+   * @example "https://analytics.example.com"
+   */
+  host?: string
   /** Optional. Respect DNT and GPC signals. Default: true. */
   respectDnt?: boolean
-  /**
-   * Optional. CSP nonce for inline scripts.
-   * Declared for forward-compatibility. Currently a no-op: the SDK uses fetch/sendBeacon
-   * for all tracking (no inline <script> injection), so there is no element to attach
-   * the nonce to. Will be consumed when/if script injection is added.
-   */
-  nonce?: string
   /** Optional. Disable all tracking (e.g. for dev/staging). Default: false. */
   disabled?: boolean
+  /**
+   * Optional. Automatically track clicks on ALL <a> tags (including Next.js <Link>)
+   * via event delegation — no code changes to existing links required.
+   *
+   * - `true`        — track all link clicks (internal + external)
+   * - `'outbound'`  — track only links to a different origin (e.g. social, docs, affiliates)
+   * - `false`       — disabled (default). Use <TrackedLink> for explicit per-link tracking.
+   *
+   * Fires a "link_click" event with `{ href, text?, external }` payload.
+   * Hash-only (#anchor) and javascript: hrefs are always ignored.
+   * For external links, `href` is the full URL; for internal links, pathname+search+hash.
+   */
+  trackLinks?: boolean | 'outbound'
+  /**
+   * Optional. Automatically track scroll depth milestones.
+   *
+   * - `true`        — fire at 25%, 50%, 75%, and 100% page scroll
+   * - `number[]`    — fire at custom percentage thresholds (e.g. `[33, 66, 100]`)
+   * - `false`       — disabled (default)
+   *
+   * Fires a `"scroll_depth"` event with `{ depth: N }` (N = integer threshold crossed).
+   * Each threshold fires at most once per page. Resets automatically on navigation.
+   */
+  trackScrollDepth?: boolean | number[]
+  /**
+   * Optional. Automatically track HTML form submissions via event delegation.
+   * Fires a `"form_submit"` event whenever any `<form>` on the page is submitted.
+   *
+   * Payload: `{ form_id?, form_name?, action? }` — all fields are optional and
+   * derived from the form element's attributes.
+   *
+   * @default false
+   */
+  trackForms?: boolean
   children: React.ReactNode
 }
 
 export interface SparklyticsHook {
   /**
    * Track a custom event.
-   * eventName: max 50 chars, alphanumeric + underscores recommended.
-   * eventData: max 4KB when JSON-serialized, max 1 level of nesting recommended.
+   *
+   * When SparklyticsEvents is augmented, known event names are type-checked
+   * and their payload shapes are enforced. Unknown event names still work
+   * with an optional Record<string, unknown> payload.
+   *
+   * Limits (enforced server-side): eventName max 50 chars;
+   * eventData max 4 KB JSON-serialized; 1 level of nesting recommended.
    */
-  track: (eventName: string, eventData?: Record<string, unknown>) => void
+  track<T extends keyof SparklyticsEvents>(
+    eventName: T,
+    eventData: SparklyticsEvents[T],
+  ): void
+  track(eventName: string, eventData?: Record<string, unknown>): void
+  /**
+   * Manually fire a pageview event.
+   *
+   * Useful for virtual pages, full-screen modals, multi-step wizards, or
+   * any UI pattern where meaningful content changes without a URL change.
+   *
+   * @param url - Optional URL to record. Defaults to `window.location.pathname`.
+   *
+   * @example
+   * ```ts
+   * const { pageview } = useSparklytics()
+   *
+   * // Track a modal open as a distinct "page" visit
+   * function openProductModal(id: string) {
+   *   pageview(`/products/${id}`)
+   * }
+   * ```
+   */
+  pageview(url?: string): void
 }
 
 // ============================================================
-// Batch event shape (internal)
+// Batch event shape (internal wire format)
 // ============================================================
+
+const UTM_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content'] as const
+type UtmKey = typeof UTM_KEYS[number]
+
+/** sessionStorage key used to persist UTM params across SPA navigations within a tab. */
+const UTM_SESSION_KEY = '_spl_utm'
 
 export interface BatchEvent {
   website_id: string
   type: 'pageview' | 'event'
   url: string
   referrer?: string
+  /** Browser language from navigator.language (e.g. "en-US"). Populates Languages breakdown. */
+  language?: string
+  /** Screen resolution as "WxH" (e.g. "1920x1080"). Populates Screen Resolutions breakdown. */
+  screen?: string
+  /** Screen width in pixels — sent alongside `screen` for server-side dimension filtering. */
+  screen_width?: number
+  /** Screen height in pixels — sent alongside `screen` for server-side dimension filtering. */
+  screen_height?: number
+  /** UTM parameters — read from URL on landing, then persisted in sessionStorage for the visit. */
+  utm_source?: string
+  utm_medium?: string
+  utm_campaign?: string
+  utm_term?: string
+  utm_content?: string
   event_name?: string
   event_data?: Record<string, unknown>
+}
+
+/**
+ * Resolve UTM parameters for the current pageview.
+ *
+ * Priority: URL query string > sessionStorage (persisted from earlier in the session).
+ * When UTMs are present in the URL they are stored in sessionStorage so they remain
+ * attached to all subsequent pageviews in the same tab — even after the user navigates
+ * to pages that no longer carry UTM query params.
+ *
+ * sessionStorage is tab-scoped and auto-cleared when the tab is closed, so a new
+ * session always starts fresh.
+ */
+function resolveUtmParams(): Partial<Pick<BatchEvent, UtmKey>> {
+  if (typeof window === 'undefined') return {}
+
+  const params = new URLSearchParams(window.location.search)
+  const fromUrl: Partial<Pick<BatchEvent, UtmKey>> = {}
+  for (const key of UTM_KEYS) {
+    const val = params.get(key)
+    if (val) fromUrl[key] = val
+  }
+
+  if (Object.keys(fromUrl).length > 0) {
+    // Fresh UTMs in the URL — persist them for the rest of this session
+    try { sessionStorage.setItem(UTM_SESSION_KEY, JSON.stringify(fromUrl)) } catch { /* quota / private mode */ }
+    return fromUrl
+  }
+
+  // No UTMs in URL — restore from session (covers SPA navigations after the landing page)
+  try {
+    const stored = sessionStorage.getItem(UTM_SESSION_KEY)
+    if (stored) return JSON.parse(stored) as Partial<Pick<BatchEvent, UtmKey>>
+  } catch { /* sessionStorage unavailable or value corrupted */ }
+
+  return {}
+}
+
+/**
+ * Collect browser-side metadata that enriches every pageview event automatically.
+ * Called at navigation time so screen and UTM values reflect the current page.
+ * SSR-safe: returns {} when window is not available.
+ */
+function getPageviewExtras(): Partial<Pick<BatchEvent, 'language' | 'screen' | 'screen_width' | 'screen_height' | UtmKey>> {
+  if (typeof window === 'undefined') return {}
+
+  const extras: Partial<Pick<BatchEvent, 'language' | 'screen' | 'screen_width' | 'screen_height' | UtmKey>> = {}
+
+  if (typeof navigator !== 'undefined' && navigator.language) {
+    extras.language = navigator.language
+  }
+
+  if (window.screen && window.screen.width && window.screen.height) {
+    extras.screen = `${window.screen.width}x${window.screen.height}`
+    extras.screen_width = window.screen.width
+    extras.screen_height = window.screen.height
+  }
+
+  return { ...extras, ...resolveUtmParams() }
 }
 
 // ============================================================
@@ -80,6 +238,7 @@ function isPrivacyBlocked(respectDnt: boolean): boolean {
 
 const SparklyticsContext = createContext<SparklyticsHook>({
   track: () => {},
+  pageview: () => {},
 })
 
 // ============================================================
@@ -87,20 +246,44 @@ const SparklyticsContext = createContext<SparklyticsHook>({
 // ============================================================
 
 export function SparklyticsProvider({
-  websiteId,
-  endpoint = '',
+  websiteId: websiteIdProp,
+  host: hostProp,
   respectDnt = true,
   disabled = false,
+  trackLinks = false,
+  trackScrollDepth = false,
+  trackForms = false,
   children,
 }: SparklyticsProviderProps) {
+  // Resolve from env vars if not provided as props.
+  // process.env.NEXT_PUBLIC_* is inlined by the Next.js bundler at build time.
+  const websiteId =
+    websiteIdProp ??
+    (typeof process !== 'undefined'
+      ? process.env.NEXT_PUBLIC_SPARKLYTICS_WEBSITE_ID ?? ''
+      : '')
+  const host =
+    hostProp ??
+    (typeof process !== 'undefined'
+      ? process.env.NEXT_PUBLIC_SPARKLYTICS_HOST ?? ''
+      : '')
+
   // Validate websiteId at runtime and fail gracefully
   if (!websiteId) {
     if (typeof console !== 'undefined') {
-      console.error('[Sparklytics] websiteId is required. No events will be sent.')
+      console.error(
+        '[Sparklytics] websiteId is required. ' +
+          'Pass it as a prop or set NEXT_PUBLIC_SPARKLYTICS_WEBSITE_ID. ' +
+          'No events will be sent.',
+      )
     }
   }
 
-  const collectUrl = endpoint ? `${endpoint}/api/collect` : '/api/collect'
+  // Trim trailing slash so "https://example.com/" and "https://example.com" both work
+  const collectUrl = host
+    ? `${host.replace(/\/$/, '')}/api/collect`
+    : '/api/collect'
+
   const queueRef = useRef<BatchEvent[]>([])
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const blockedRef = useRef<boolean>(false)
@@ -131,26 +314,39 @@ export function SparklyticsProvider({
 
     const send = async () => {
       const body = JSON.stringify(batch)
+
+      // Prefer sendBeacon for fire-and-forget delivery (survives tab close).
+      // Fall back to fetch if sendBeacon is unavailable OR returns false
+      // (browser rejected the request — e.g. queue full, tab already unloading).
       if (typeof navigator !== 'undefined' && navigator.sendBeacon) {
-        // Must send as Blob with application/json — raw string sends text/plain which the server rejects
-        navigator.sendBeacon(
+        const queued = navigator.sendBeacon(
           collectUrlRef.current,
           new Blob([body], { type: 'application/json' }),
         )
-      } else {
-        await fetch(collectUrlRef.current, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body,
-          keepalive: true,
-        })
+        if (queued) return // Beacon accepted — we're done
+        // Beacon rejected — fall through to fetch
+      }
+
+      const response = await fetch(collectUrlRef.current, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        keepalive: true,
+      })
+
+      // Treat HTTP errors (4xx, 5xx) the same as network errors so the
+      // retry logic below catches transient server failures (e.g. 429, 503).
+      if (!response.ok) {
+        throw new Error(`[Sparklytics] collect endpoint returned ${response.status}`)
       }
     }
 
     try {
       await send()
     } catch {
-      // Retry once after 2 seconds, then drop — events are fire-and-forget
+      // Retry once after 2 seconds, then drop — events are fire-and-forget.
+      // The queue was already spliced above so failed events are not re-queued;
+      // subsequent track() calls continue to work normally.
       setTimeout(async () => {
         try {
           await send()
@@ -208,6 +404,7 @@ export function SparklyticsProvider({
       type: 'pageview',
       url: window.location.pathname,
       referrer: document.referrer || undefined,
+      ...getPageviewExtras(),
     })
 
     // Flush on tab close (best-effort via sendBeacon)
@@ -224,6 +421,7 @@ export function SparklyticsProvider({
         type: 'pageview',
         url: window.location.pathname,
         referrer: document.referrer || undefined,
+        ...getPageviewExtras(),
       })
     }
 
@@ -234,12 +432,13 @@ export function SparklyticsProvider({
         type: 'pageview',
         url: window.location.pathname,
         referrer: document.referrer || undefined,
+        ...getPageviewExtras(),
       })
     }
     window.addEventListener('popstate', handlePopState)
 
-    // Pages Router: listen to routeChangeComplete for router.replace() / shallow routing
-    // Dynamic import avoids breaking App Router builds where next/router is not in use
+    // Pages Router: listen to routeChangeComplete for router.replace() / shallow routing.
+    // Dynamic import avoids breaking App Router builds where next/router is not in use.
     let cleanupPagesRouter: (() => void) | null = null
     import('next/router')
       .then(mod => {
@@ -250,6 +449,7 @@ export function SparklyticsProvider({
             type: 'pageview',
             url,
             referrer: document.referrer || undefined,
+            ...getPageviewExtras(),
           })
         }
         router.events?.on('routeChangeComplete', handleRouteChange)
@@ -261,16 +461,151 @@ export function SparklyticsProvider({
         // next/router not available (App Router project) — pushState monkey-patch handles it
       })
 
+    // Link click delegation — tracks ALL <a href> clicks when trackLinks is enabled.
+    // Uses capture phase so we fire before React's synthetic onClick handlers
+    // (and before Next.js can preventDefault for client-side navigation).
+    // The tracking is fire-and-forget; we never interfere with navigation.
+    let cleanupLinkTracking: (() => void) | null = null
+    if (trackLinks) {
+      const handleLinkClick = (e: MouseEvent) => {
+        if (blockedRef.current) return
+
+        // Walk up from the click target to find the nearest <a href>
+        const anchor = (e.target as HTMLElement | null)?.closest<HTMLAnchorElement>('a[href]')
+        if (!anchor) return
+
+        const rawHref = anchor.getAttribute('href') ?? ''
+        // Skip hash-only anchors (e.g. "#", "#section") and javascript: pseudo-links
+        if (!rawHref || rawHref.startsWith('#') || rawHref.startsWith('javascript:')) return
+
+        let href = rawHref
+        let external = false
+        try {
+          const url = new URL(rawHref, window.location.href)
+          external = url.origin !== window.location.origin
+          // Normalise: full URL for external, pathname+search+hash for internal
+          href = external ? url.href : url.pathname + url.search + url.hash
+        } catch {
+          // Malformed href (e.g. mailto:, tel:) — use raw value, treat as external
+          external = true
+        }
+
+        // 'outbound' mode: skip internal links
+        if (trackLinks === 'outbound' && !external) return
+
+        // Capture visible link text (trimmed, collapsed whitespace, max 100 chars)
+        const text = anchor.textContent?.trim().replace(/\s+/g, ' ').slice(0, 100) || undefined
+
+        enqueue({
+          website_id: websiteId,
+          type: 'event',
+          url: window.location.pathname,
+          event_name: 'link_click',
+          event_data: {
+            href,
+            ...(text ? { text } : {}),
+            ...(external ? { external: true } : {}),
+          },
+        })
+      }
+
+      document.addEventListener('click', handleLinkClick, { capture: true })
+      cleanupLinkTracking = () =>
+        document.removeEventListener('click', handleLinkClick, { capture: true })
+    }
+
+    // Scroll depth tracking — fires "scroll_depth" event at configurable percentage thresholds.
+    // Each threshold fires at most once per page URL; resets automatically on navigation.
+    let cleanupScrollTracking: (() => void) | null = null
+    if (trackScrollDepth !== false) {
+      const thresholds: number[] =
+        Array.isArray(trackScrollDepth) ? trackScrollDepth : [25, 50, 75, 100]
+
+      // Mutable state for the current page's fired set and its URL.
+      // Checked and reset lazily at scroll time for zero overhead on navigation.
+      let scrollFired = new Set<number>()
+      let lastScrollUrl = window.location.pathname
+
+      const handleScroll = () => {
+        if (blockedRef.current) return
+
+        // Reset fired set when the URL has changed (SPA navigation happened since last scroll).
+        const currentUrl = window.location.pathname
+        if (currentUrl !== lastScrollUrl) {
+          scrollFired = new Set<number>()
+          lastScrollUrl = currentUrl
+        }
+
+        const scrollTop = window.scrollY ?? document.documentElement.scrollTop
+        const docHeight =
+          document.documentElement.scrollHeight - window.innerHeight
+        if (docHeight <= 0) return
+
+        const pct = Math.round((scrollTop / docHeight) * 100)
+
+        for (const threshold of thresholds) {
+          if (pct >= threshold && !scrollFired.has(threshold)) {
+            scrollFired.add(threshold)
+            enqueue({
+              website_id: websiteId,
+              type: 'event',
+              url: currentUrl,
+              event_name: 'scroll_depth',
+              event_data: { depth: threshold },
+            })
+          }
+        }
+      }
+
+      window.addEventListener('scroll', handleScroll, { passive: true })
+      cleanupScrollTracking = () => window.removeEventListener('scroll', handleScroll)
+    }
+
+    // Form submission tracking — fires "form_submit" event on every <form> submit.
+    // Uses capture phase so we fire before the form's own submit handler.
+    let cleanupFormTracking: (() => void) | null = null
+    if (trackForms) {
+      const handleSubmit = (e: Event) => {
+        if (blockedRef.current) return
+        const form = e.target as HTMLFormElement | null
+        if (!form || form.tagName !== 'FORM') return
+
+        const data: Record<string, unknown> = {}
+        if (form.id) data['form_id'] = form.id
+        if (form.name) data['form_name'] = form.name
+        // Include action only if it's a real URL (not a javascript: pseudo-href)
+        if (form.action && !form.action.startsWith('javascript:')) {
+          data['action'] = form.action
+        }
+
+        enqueue({
+          website_id: websiteId,
+          type: 'event',
+          url: window.location.pathname,
+          event_name: 'form_submit',
+          event_data: data,
+        })
+      }
+
+      document.addEventListener('submit', handleSubmit, { capture: true })
+      cleanupFormTracking = () =>
+        document.removeEventListener('submit', handleSubmit, { capture: true })
+    }
+
     return () => {
       window.removeEventListener('beforeunload', handleUnload)
       window.removeEventListener('popstate', handlePopState)
       history.pushState = originalPushState
       cleanupPagesRouter?.()
+      cleanupLinkTracking?.()
+      cleanupScrollTracking?.()
+      cleanupFormTracking?.()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [websiteId, disabled, respectDnt])
+  }, [websiteId, disabled, respectDnt, trackLinks, trackScrollDepth, trackForms])
 
-  // Custom event tracker exposed via hook
+  // Custom event tracker exposed via hook.
+  // The implementation signature accepts the union of both overloads.
   const track = (eventName: string, eventData?: Record<string, unknown>) => {
     enqueue({
       website_id: websiteId,
@@ -282,21 +617,30 @@ export function SparklyticsProvider({
     })
   }
 
+  // Manual pageview — lets consumers fire a pageview outside of automatic navigation detection.
+  // Useful for full-screen modals, multi-step wizards, or virtual pages.
+  const pageview = (url?: string) => {
+    enqueue({
+      website_id: websiteId,
+      type: 'pageview',
+      url: url ?? (typeof window !== 'undefined' ? window.location.pathname : '/'),
+      referrer: typeof document !== 'undefined' ? document.referrer || undefined : undefined,
+      ...getPageviewExtras(),
+    })
+  }
+
   return React.createElement(
     SparklyticsContext.Provider,
-    { value: { track } },
+    { value: { track, pageview } },
     React.createElement(AppRouterTracker, {
-      websiteId,
-      // Note: blockedRef.current is read at render time (before the blocking useEffect runs),
-      // so this prop may be stale on the first render. AppRouterTracker is currently a stub;
-      // future usePathname()-based implementations should read blockedRef via a callback instead.
-      disabled: blockedRef.current,
+      // enqueue() reads blockedRef.current internally, so no need to pass disabled here.
       onNavigate: (url: string) => {
         enqueue({
           website_id: websiteId,
           type: 'pageview',
           url,
           referrer: typeof document !== 'undefined' ? document.referrer || undefined : undefined,
+          ...getPageviewExtras(),
         })
       },
     }),
@@ -306,22 +650,47 @@ export function SparklyticsProvider({
 
 // ============================================================
 // AppRouterTracker — internal child component
-// Placeholder for App Router navigation detection.
-// Primary navigation tracking (pushState + popstate) is handled
-// in SparklyticsProvider's main useEffect, which captures all
-// Next.js App Router <Link> navigations (App Router uses pushState
-// internally for soft navigations).
-// This component exists as an extension point for future
-// usePathname()-based tracking once Next.js types are added.
+//
+// Uses usePathname() from next/navigation to detect App Router
+// navigations, including router.replace() calls that bypass
+// history.pushState (which the parent's monkey-patch misses).
+//
+// The initial pageview is handled by SparklyticsProvider's main
+// useEffect; AppRouterTracker only fires on subsequent path changes.
+//
+// Duplicate pageviews (pushState + usePathname firing for the same
+// navigation) are caught by the 100ms URL-based dedup in enqueue().
 // ============================================================
 
 interface AppRouterTrackerProps {
-  websiteId: string
-  disabled: boolean
   onNavigate: (url: string) => void
 }
 
-function AppRouterTracker(_props: AppRouterTrackerProps) {
+function AppRouterTracker({ onNavigate }: AppRouterTrackerProps) {
+  const rawPathname = usePathname()
+  // usePathname() returns null outside a Next.js context (rare edge case).
+  // Fall back to '/' so prevPathRef always gets a defined initial value.
+  const pathname = rawPathname ?? '/'
+
+  const prevPathRef = useRef<string | null>(null)
+
+  // Keep onNavigate stable via ref to avoid stale closure without
+  // adding it to the effect's dependency array.
+  const onNavigateRef = useRef(onNavigate)
+  onNavigateRef.current = onNavigate
+
+  useEffect(() => {
+    if (prevPathRef.current === null) {
+      // First mount — record initial path, don't fire (parent handles initial pageview).
+      prevPathRef.current = pathname
+      return
+    }
+    if (prevPathRef.current !== pathname) {
+      onNavigateRef.current(pathname)
+      prevPathRef.current = pathname
+    }
+  }, [pathname])
+
   return null
 }
 
@@ -361,4 +730,67 @@ export function SparklyticsEvent({ name, data, children }: SparklyticsEventProps
       }
     },
   } as React.HTMLAttributes<HTMLElement>)
+}
+
+// ============================================================
+// TrackedLink — Next.js <Link> wrapper with automatic click tracking
+//
+// Drop-in replacement for next/link's <Link>. Fires a Sparklytics
+// event on every click with the href automatically captured so you
+// never have to wire onClick manually.
+//
+// Usage:
+//   <TrackedLink href="/pricing">View pricing</TrackedLink>
+//
+//   // Custom event name + extra data:
+//   <TrackedLink href="/blog/post" eventName="blog_cta" eventData={{ position: 'hero' }}>
+//     Read post
+//   </TrackedLink>
+// ============================================================
+
+export interface TrackedLinkProps extends React.ComponentPropsWithoutRef<typeof Link> {
+  /**
+   * Sparklytics event name fired on click.
+   * @default "link_click"
+   */
+  eventName?: string
+  /**
+   * Extra event payload merged with the auto-captured `href`.
+   * Useful for tracking position, variant, or other context.
+   */
+  eventData?: Record<string, unknown>
+}
+
+/**
+ * Next.js-aware `<Link>` wrapper that fires a Sparklytics event on every click.
+ *
+ * The `href` prop is automatically captured as `{ href: '...' }` in event data.
+ * Any `eventData` you provide is merged alongside it.
+ * Existing `onClick` handlers are preserved and called after tracking.
+ *
+ * For UrlObject hrefs (e.g. `{ pathname: '/products', query: { id: 42 } }`)
+ * the `href` in event data is derived from `pathname`.
+ */
+export function TrackedLink({
+  eventName = 'link_click',
+  eventData,
+  onClick,
+  ...linkProps
+}: TrackedLinkProps) {
+  const { track } = useSparklytics()
+
+  const handleClick: React.MouseEventHandler<HTMLAnchorElement> = (e) => {
+    // Resolve href to a string for the event payload.
+    // next/link accepts string | UrlObject; for objects use pathname.
+    const href =
+      typeof linkProps.href === 'string'
+        ? linkProps.href
+        : (linkProps.href as { pathname?: string })?.pathname ?? ''
+
+    track(eventName, { href, ...eventData })
+
+    if (typeof onClick === 'function') onClick(e)
+  }
+
+  return React.createElement(Link, { ...linkProps, onClick: handleClick })
 }
