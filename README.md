@@ -5,6 +5,10 @@ Official Next.js SDK for [Sparklytics](https://sparklytics.dev) — open-source,
 [![npm](https://img.shields.io/npm/v/@sparklytics/next)](https://www.npmjs.com/package/@sparklytics/next)
 [![Bundle size](https://img.shields.io/bundlephobia/minzip/@sparklytics/next)](https://bundlephobia.com/package/@sparklytics/next)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://github.com/Sparklytics/sparklytics/blob/main/LICENSE)
+![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/Sparklytics/sparklytics?utm_source=oss&utm_medium=github&utm_campaign=Sparklytics%2Fsparklytics&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
+![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/Sparklytics/sparklytics-js?utm_source=oss&utm_medium=github&utm_campaign=Sparklytics%2Fsparklytics-js&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
+![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/Sparklytics/sparklytics-next?utm_source=oss&utm_medium=github&utm_campaign=Sparklytics%2Fsparklytics-next&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
+![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/Sparklytics/sparklytics-vue?utm_source=oss&utm_medium=github&utm_campaign=Sparklytics%2Fsparklytics-vue&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
 
 - **Automatic pageview tracking** — App Router and Pages Router, zero config
 - **Typed custom events** — TypeScript autocomplete on your own event names and payloads
