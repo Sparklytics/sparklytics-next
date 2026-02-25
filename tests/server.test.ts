@@ -6,7 +6,14 @@
  * but unused; global fetch is available for mocking.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { trackServerPageview, trackServerEvent, createServerClient } from '../src/server'
+import {
+  trackServerPageview,
+  trackServerEvent,
+  createServerClient,
+  withAnalytics,
+  trackServerMiddleware,
+  type WithAnalyticsConfig,
+} from '../src/server'
 
 // ──────────────────────────────────────────────────────────────
 // Setup / teardown
@@ -499,5 +506,321 @@ describe('createServerClient', () => {
     await expect(analytics.fromRequest(request).trackPageview()).rejects.toThrow(
       '[Sparklytics] server collect returned 500',
     )
+  })
+})
+
+// ──────────────────────────────────────────────────────────────
+// Feature: visitorId on one-off helpers
+// ──────────────────────────────────────────────────────────────
+
+describe('server-side visitorId', () => {
+  it('test_trackServerPageview_visitorId — visitor_id is included in event payload', async () => {
+    await trackServerPageview({
+      host: 'https://analytics.example.com',
+      websiteId: 'site_1',
+      url: '/dashboard',
+      visitorId: 'abc123def456',
+    })
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    const event = (JSON.parse(init.body as string) as Record<string, unknown>[])[0]
+    expect(event['visitor_id']).toBe('abc123def456')
+  })
+
+  it('test_trackServerEvent_visitorId — visitor_id is included in event payload', async () => {
+    await trackServerEvent({
+      host: 'https://analytics.example.com',
+      websiteId: 'site_1',
+      url: '/checkout',
+      eventName: 'purchase',
+      visitorId: 'deadbeef1234',
+    })
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    const event = (JSON.parse(init.body as string) as Record<string, unknown>[])[0]
+    expect(event['visitor_id']).toBe('deadbeef1234')
+  })
+
+  it('test_visitorId_omitted_when_not_set — visitor_id absent when visitorId not provided', async () => {
+    await trackServerPageview({
+      host: 'https://analytics.example.com',
+      websiteId: 'site_1',
+      url: '/home',
+    })
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    const event = (JSON.parse(init.body as string) as Record<string, unknown>[])[0]
+    expect(event['visitor_id']).toBeUndefined()
+  })
+
+  it('test_createServerClient_trackPageview_visitorId — visitorId forwarded via client method', async () => {
+    const analytics = createServerClient({
+      host: 'https://analytics.example.com',
+      websiteId: 'site_1',
+    })
+
+    await analytics.trackPageview({ url: '/page', visitorId: 'visitor_from_client' })
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    const event = (JSON.parse(init.body as string) as Record<string, unknown>[])[0]
+    expect(event['visitor_id']).toBe('visitor_from_client')
+  })
+})
+
+// ──────────────────────────────────────────────────────────────
+// Feature: withAnalytics HOC
+// ──────────────────────────────────────────────────────────────
+
+describe('withAnalytics', () => {
+  it('test_withAnalytics_get_auto_tracks_pageview — GET request auto-fires pageview', async () => {
+    const handler = withAnalytics(
+      async (_request, _analytics) => Response.json({ ok: true }),
+      { host: 'https://analytics.example.com', websiteId: 'site_1' },
+    )
+
+    // new Request() defaults to GET
+    const request = new Request('https://myapp.com/products')
+    await handler(request)
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('https://analytics.example.com/api/collect')
+    const event = (JSON.parse(init.body as string) as Record<string, unknown>[])[0]
+    expect(event['type']).toBe('pageview')
+    expect(event['url']).toBe('/products')
+  })
+
+  it('test_withAnalytics_post_no_auto_pageview — POST does not auto-track pageview', async () => {
+    const handler = withAnalytics(
+      async (_request, _analytics) => Response.json({ ok: true }),
+      { host: 'https://analytics.example.com', websiteId: 'site_1' },
+    )
+
+    const request = new Request('https://myapp.com/api/checkout', { method: 'POST' })
+    await handler(request)
+
+    // No fetch call — POST does not auto-track a pageview
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('test_withAnalytics_post_explicit_pageview_true — pageview:true forces tracking on POST', async () => {
+    const config: WithAnalyticsConfig = {
+      host: 'https://analytics.example.com',
+      websiteId: 'site_1',
+      pageview: true,
+    }
+    const handler = withAnalytics(
+      async (_request, _analytics) => Response.json({ ok: true }),
+      config,
+    )
+
+    const request = new Request('https://myapp.com/api/checkout', { method: 'POST' })
+    await handler(request)
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    const event = (JSON.parse(init.body as string) as Record<string, unknown>[])[0]
+    expect(event['type']).toBe('pageview')
+  })
+
+  it('test_withAnalytics_get_explicit_pageview_false — pageview:false suppresses tracking on GET', async () => {
+    const config: WithAnalyticsConfig = {
+      host: 'https://analytics.example.com',
+      websiteId: 'site_1',
+      pageview: false,
+    }
+    const handler = withAnalytics(
+      async (_request, _analytics) => Response.json({ ok: true }),
+      config,
+    )
+
+    const request = new Request('https://myapp.com/products') // GET by default
+    await handler(request)
+
+    // pageview: false suppresses even though it's a GET
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('test_withAnalytics_injects_analytics — handler receives BoundServerClient', async () => {
+    let capturedAnalytics: unknown = null
+
+    const handler = withAnalytics(
+      async (_request, analytics) => {
+        capturedAnalytics = analytics
+        return Response.json({ ok: true })
+      },
+      { host: 'https://analytics.example.com', websiteId: 'site_1' },
+    )
+
+    await handler(new Request('https://myapp.com/page'))
+
+    expect(capturedAnalytics).not.toBeNull()
+    expect(typeof (capturedAnalytics as { trackPageview: unknown }).trackPageview).toBe('function')
+    expect(typeof (capturedAnalytics as { trackEvent: unknown }).trackEvent).toBe('function')
+  })
+
+  it('test_withAnalytics_handler_can_track_additional_events — analytics.trackEvent works inside handler', async () => {
+    const handler = withAnalytics(
+      async (_request, analytics) => {
+        await analytics.trackEvent({ eventName: 'purchase', eventData: { amount: 99.99 } })
+        return Response.json({ ok: true })
+      },
+      { host: 'https://analytics.example.com', websiteId: 'site_1' },
+    )
+
+    await handler(new Request('https://myapp.com/checkout'))
+
+    // Two fetches: auto-pageview + explicit event
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit]
+    const event = (JSON.parse(init.body as string) as Record<string, unknown>[])[0]
+    expect(event['event_name']).toBe('purchase')
+    expect(event['event_data']).toEqual({ amount: 99.99 })
+  })
+
+  it('test_withAnalytics_returns_handler_response — Response from handler is returned unchanged', async () => {
+    const handler = withAnalytics(
+      async (_request, _analytics) => new Response('Hello', { status: 201 }),
+      { host: 'https://analytics.example.com', websiteId: 'site_1' },
+    )
+
+    const response = await handler(new Request('https://myapp.com/'))
+    expect(response.status).toBe(201)
+    expect(await response.text()).toBe('Hello')
+  })
+
+  it('test_withAnalytics_passes_context — context arg forwarded to handler', async () => {
+    let capturedContext: unknown = null
+    const ctx = { params: { id: '42' } }
+
+    const handler = withAnalytics<{ params: { id: string } }>(
+      async (_request, _analytics, context) => {
+        capturedContext = context
+        return Response.json({ ok: true })
+      },
+      { host: 'https://analytics.example.com', websiteId: 'site_1' },
+    )
+
+    await handler(new Request('https://myapp.com/items/42'), ctx)
+    expect(capturedContext).toEqual(ctx)
+  })
+
+  it('test_withAnalytics_env_fallback — reads host/websiteId from env when config omitted', async () => {
+    vi.stubEnv('SPARKLYTICS_HOST', 'https://env-host.example.com')
+    vi.stubEnv('SPARKLYTICS_WEBSITE_ID', 'site_env')
+
+    const handler = withAnalytics(
+      async (_request, _analytics) => Response.json({ ok: true }),
+    )
+
+    await handler(new Request('https://myapp.com/page'))
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('https://env-host.example.com/api/collect')
+    const event = (JSON.parse(init.body as string) as Record<string, unknown>[])[0]
+    expect(event['website_id']).toBe('site_env')
+  })
+
+  it('test_withAnalytics_silent_default — tracking errors do not break handler', async () => {
+    // Make tracking fail
+    fetchMock
+      .mockResolvedValueOnce(new Response('', { status: 500 })) // auto-pageview fails
+      .mockResolvedValueOnce(new Response('{}', { status: 200 })) // not reached in this test
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const handler = withAnalytics(
+      async (_request, _analytics) => Response.json({ ok: true }),
+      { host: 'https://analytics.example.com', websiteId: 'site_1' },
+    )
+
+    // Handler should still return normally even though tracking failed
+    const response = await handler(new Request('https://myapp.com/page'))
+    expect(response.status).toBe(200)
+    expect(warnSpy).toHaveBeenCalledTimes(1)
+    expect(warnSpy.mock.calls[0]?.[0]).toContain('[Sparklytics]')
+
+    warnSpy.mockRestore()
+  })
+})
+
+// ──────────────────────────────────────────────────────────────
+// Feature: trackServerMiddleware
+// ──────────────────────────────────────────────────────────────
+
+describe('trackServerMiddleware', () => {
+  it('test_trackServerMiddleware_sends_pageview — fires pageview with env host/websiteId', async () => {
+    vi.stubEnv('SPARKLYTICS_HOST', 'https://analytics.example.com')
+    vi.stubEnv('SPARKLYTICS_WEBSITE_ID', 'site_middleware')
+
+    const request = new Request('https://myapp.com/about')
+    await trackServerMiddleware(request)
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('https://analytics.example.com/api/collect')
+    const event = (JSON.parse(init.body as string) as Record<string, unknown>[])[0]
+    expect(event['type']).toBe('pageview')
+    expect(event['website_id']).toBe('site_middleware')
+    expect(event['url']).toBe('/about')
+  })
+
+  it('test_trackServerMiddleware_extracts_headers — userAgent, ip, language auto-populated', async () => {
+    vi.stubEnv('SPARKLYTICS_HOST', 'https://analytics.example.com')
+    vi.stubEnv('SPARKLYTICS_WEBSITE_ID', 'site_1')
+
+    const request = new Request('https://myapp.com/blog', {
+      headers: {
+        'user-agent':      'Mozilla/5.0 (Windows NT 10.0)',
+        'x-forwarded-for': '203.0.113.5, 10.0.0.1',
+        'accept-language': 'de-DE',
+      },
+    })
+
+    await trackServerMiddleware(request)
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    const headers = init.headers as Record<string, string>
+    expect(headers['User-Agent']).toBe('Mozilla/5.0 (Windows NT 10.0)')
+    expect(headers['X-Forwarded-For']).toBe('203.0.113.5')
+
+    const event = (JSON.parse(init.body as string) as Record<string, unknown>[])[0]
+    expect(event['language']).toBe('de-DE')
+  })
+
+  it('test_trackServerMiddleware_silent_by_default — errors do not propagate', async () => {
+    vi.stubEnv('SPARKLYTICS_HOST', 'https://analytics.example.com')
+    vi.stubEnv('SPARKLYTICS_WEBSITE_ID', 'site_1')
+    fetchMock.mockResolvedValue(new Response('', { status: 500 }))
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const request = new Request('https://myapp.com/')
+    await expect(trackServerMiddleware(request)).resolves.toBeUndefined()
+    expect(warnSpy).toHaveBeenCalledTimes(1)
+
+    warnSpy.mockRestore()
+  })
+
+  it('test_trackServerMiddleware_strict_mode — silent: false propagates errors', async () => {
+    vi.stubEnv('SPARKLYTICS_HOST', 'https://analytics.example.com')
+    vi.stubEnv('SPARKLYTICS_WEBSITE_ID', 'site_1')
+    fetchMock.mockResolvedValue(new Response('', { status: 503, statusText: 'Service Unavailable' }))
+
+    const request = new Request('https://myapp.com/')
+    await expect(trackServerMiddleware(request, { silent: false })).rejects.toThrow(
+      '[Sparklytics] server collect returned 503',
+    )
+  })
+
+  it('test_trackServerMiddleware_url_override — custom url option overrides auto-extracted path', async () => {
+    vi.stubEnv('SPARKLYTICS_HOST', 'https://analytics.example.com')
+    vi.stubEnv('SPARKLYTICS_WEBSITE_ID', 'site_1')
+
+    const request = new Request('https://myapp.com/actual-path')
+    await trackServerMiddleware(request, { url: '/virtual-page' })
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    const event = (JSON.parse(init.body as string) as Record<string, unknown>[])[0]
+    expect(event['url']).toBe('/virtual-page')
   })
 })

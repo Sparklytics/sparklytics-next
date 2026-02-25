@@ -12,6 +12,11 @@ Official Next.js SDK for [Sparklytics](https://sparklytics.dev) — open-source,
 - **No cookies** — privacy-respecting by default, DNT and GPC supported
 - **Batched delivery** — events are queued and sent in one request, not one-per-event
 - **Server-side tracking** — Route Handlers, Server Actions, and Middleware via `@sparklytics/next/server`
+- **`withAnalytics()` HOC** — auto-tracks pageview + injects analytics client in one line per Route Handler
+- **`trackServerMiddleware()`** — single-line pageview tracking in `middleware.ts`
+- **`<Track>` component** — declarative event tracking on click, focus, hover, submit, and more
+- **`usePageview()` hook** — standalone Pages Router hook, zero-config from env vars
+- **`identify()` / `reset()`** — cross-session visitor stitching with hashed user IDs
 
 ---
 
@@ -84,7 +89,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 }
 ```
 
-### Pages Router — `pages/_app.tsx`
+### Pages Router — Option A: `<SparklyticsProvider>`
 
 ```tsx
 import type { AppProps } from 'next/app'
@@ -99,6 +104,30 @@ export default function App({ Component, pageProps }: AppProps) {
   )
 }
 ```
+
+### Pages Router — Option B: `usePageview()` hook ✨
+
+If you prefer a hook-only setup (no Provider), `usePageview()` handles all Pages Router navigation automatically:
+
+```tsx
+// pages/_app.tsx
+import type { AppProps } from 'next/app'
+import { usePageview } from '@sparklytics/next'
+
+export default function App({ Component, pageProps }: AppProps) {
+  usePageview() // reads NEXT_PUBLIC_SPARKLYTICS_WEBSITE_ID + NEXT_PUBLIC_SPARKLYTICS_HOST from env
+  return <Component {...pageProps} />
+}
+```
+
+`usePageview()` tracks: the initial page load, every `routeChangeComplete` from `next/router`, and browser back/forward (`popstate`). For App Router, use `<SparklyticsProvider>` instead — it hooks into `usePathname()` internally.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `websiteId` | `string` | `NEXT_PUBLIC_SPARKLYTICS_WEBSITE_ID` | Explicit website ID. Falls back to env var. |
+| `host` | `string` | `NEXT_PUBLIC_SPARKLYTICS_HOST` | Explicit host. Falls back to env var. |
+| `disabled` | `boolean` | `false` | Disable all tracking. |
+| `respectDnt` | `boolean` | `true` | Honour DNT and GPC signals. |
 
 That's it. Pageviews are tracked automatically on every route change — including `<Link>` clicks, browser back/forward, `router.push()`, and `router.replace()`.
 
@@ -178,20 +207,42 @@ export function ProductModal({ id }: { id: string }) {
 
 `pageview(url?)` — `url` defaults to `window.location.pathname` when omitted.
 
-### `<SparklyticsEvent>` component
+### `<Track>` component — declarative event tracking
 
-Wrap any element with `<SparklyticsEvent>` to track clicks declaratively — no handler needed:
+The simplest way to attach analytics to any element. No hook, no `onClick` boilerplate:
 
 ```tsx
-import { SparklyticsEvent } from '@sparklytics/next'
+import { Track } from '@sparklytics/next'
 
-// Tracks "hero_cta" on click, preserves the button's existing onClick
-<SparklyticsEvent name="hero_cta" data={{ variant: 'A', position: 'above_fold' }}>
-  <button onClick={existingHandler}>Start free trial</button>
-</SparklyticsEvent>
+// Click tracking (default)
+<Track event="cta_clicked" data={{ plan: 'pro' }}>
+  <button>Start free trial</button>
+</Track>
+
+// Hover tracking
+<Track event="pricing_hovered" trigger="mouseenter">
+  <div className="pricing-card">...</div>
+</Track>
+
+// Form focus / blur
+<Track event="email_field_focused" trigger="focus">
+  <input type="email" placeholder="you@example.com" />
+</Track>
+
+// Form submit
+<Track event="contact_submitted" trigger="submit">
+  <form>...</form>
+</Track>
 ```
 
-`<SparklyticsEvent>` accepts a single child element, fires `track()` on click, and calls the child's existing `onClick` (if any) afterwards. It never swallows the event.
+`<Track>` accepts a single child element and injects the event handler alongside any existing handler — the child's own `onClick` / `onFocus` / etc. is always called after tracking.
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `event` | `string` | _(required)_ | Event name to fire. Max 50 chars. |
+| `data` | `Record<string, unknown>` | `undefined` | Optional event payload. Max 4 KB. |
+| `trigger` | `'click' \| 'focus' \| 'blur' \| 'mouseenter' \| 'mouseleave' \| 'submit'` | `'click'` | DOM event that triggers tracking. |
+| `children` | `React.ReactElement` | _(required)_ | Single child element. |
 
 ### `<TrackedLink>` component
 
@@ -265,6 +316,49 @@ track('checkout_started', { cart_value: 49.99 })
 ```
 
 No runtime overhead — the `SparklyticsEvents` interface is erased at compile time.
+
+---
+
+## Visitor identification
+
+`identify(visitorId)` stitches anonymous visits with known user profiles across sessions. Call it after login; call `reset()` on logout.
+
+Both functions are available as **standalone module-level imports** — no React Provider or hook required. This makes them easy to call from auth callbacks, Server Actions, or any non-component code.
+
+```ts
+// works anywhere — auth callbacks, _app.tsx, event handlers, etc.
+import { identify, reset } from '@sparklytics/next'
+
+async function onLoginSuccess(userId: string) {
+  // Hash the userId — never pass raw IDs
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(userId))
+  const hex = Array.from(new Uint8Array(digest))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('')
+  identify(hex.slice(0, 16)) // e.g. "a3f8b2c1d4e59067"
+}
+
+function onLogout() {
+  reset() // clear stitching — future visits are anonymous again
+}
+```
+
+They are also available through the `useSparklytics()` hook if you already have one in scope:
+
+```ts
+'use client'
+const { identify, reset } = useSparklytics()
+```
+
+**How it works:**
+- `identify(id)` writes the ID to `localStorage` under `sparklytics_visitor_id`.
+- All subsequent tracking calls (`track()`, `pageview()`, `usePageview()`) attach it as `visitor_id` in the event payload.
+- The analytics backend uses this instead of its computed IP + User-Agent fingerprint.
+- `reset()` removes the key from `localStorage` — future events have no `visitor_id`.
+
+**Privacy note:** always pass a hashed or tokenised identifier. Never pass raw email addresses, numeric user IDs, or any directly reversible identifier.
+
+For server-side visitor stitching, pass `visitorId` as an option to any `ServerClient` method or `withAnalytics` handler.
 
 ---
 
@@ -344,9 +438,7 @@ Every submission fires a `"form_submit"` event. The payload is derived from the 
 
 Import from `@sparklytics/next/server` to track events from **Route Handlers**, **Server Actions**, and **Middleware** — no React, no browser APIs required.
 
-### Zero-config setup ✨
-
-Set two env vars once, then create a client — no configuration on every call:
+Set these env vars once; every server helper reads them automatically:
 
 ```bash
 # .env.local
@@ -354,24 +446,105 @@ SPARKLYTICS_HOST=https://analytics.example.com
 SPARKLYTICS_WEBSITE_ID=site_abc123def456
 ```
 
+### `withAnalytics(handler)` — Route Handler HOC ✨ (least boilerplate)
+
+Wraps any Route Handler: injects a pre-bound analytics client and automatically tracks a pageview for **GET and HEAD requests** (following HTTP semantics — mutation verbs like POST/PUT/DELETE are API actions, not page views).
+
+```ts
+// app/products/route.ts  — GET: auto-tracks pageview, injects analytics
+import { withAnalytics } from '@sparklytics/next/server'
+
+export const GET = withAnalytics(async (request, analytics) => {
+  await analytics.trackEvent({ eventName: 'product_list_viewed' })
+  return Response.json({ products: [] })
+})
+```
+
+```ts
+// app/api/checkout/route.ts  — POST: no auto-pageview; track your own event
+import { withAnalytics } from '@sparklytics/next/server'
+
+export const POST = withAnalytics(async (request, analytics) => {
+  const { amount } = await request.json() as { amount: number }
+  await analytics.trackEvent({ eventName: 'purchase', eventData: { amount } })
+  return Response.json({ ok: true })
+})
+```
+
+Override the default with `pageview: true | false` in the config:
+
+```ts
+// Force-track a pageview on a POST route that renders a page response
+export const POST = withAnalytics(handler, { pageview: true })
+
+// Suppress auto-pageview for a GET data API endpoint
+export const GET = withAnalytics(handler, { pageview: false })
+```
+
+With dynamic route params:
+
+```ts
+// app/api/orders/[id]/route.ts
+import { withAnalytics } from '@sparklytics/next/server'
+
+export const GET = withAnalytics<{ params: Promise<{ id: string }> }>(
+  async (request, analytics, context) => {
+    const { id } = await context!.params
+    await analytics.trackEvent({ eventName: 'order_viewed', eventData: { id } })
+    return Response.json({ id })
+  },
+)
+```
+
+`withAnalytics(handler, config?)` — `config` is optional (`WithAnalyticsConfig`). Reads env vars automatically when omitted.
+
+### `trackServerMiddleware(request)` — Middleware tracking ✨
+
+One line in `middleware.ts` tracks a pageview for every page visit — headers extracted automatically:
+
+```ts
+// middleware.ts
+import { trackServerMiddleware } from '@sparklytics/next/server'
+import { NextResponse } from 'next/server'
+
+export async function middleware(request: Request) {
+  await trackServerMiddleware(request)
+  return NextResponse.next()
+}
+
+export const config = {
+  matcher: ['/((?!_next/static|_next/image|favicon.ico|api/).*)'],
+}
+```
+
+Custom URL override or strict mode:
+
+```ts
+await trackServerMiddleware(request, { url: '/virtual-page' })
+await trackServerMiddleware(request, { silent: false }) // propagate errors
+```
+
+### Zero-config `createServerClient()` ✨
+
+Create a client once, import it anywhere — `host` and `websiteId` come from env vars:
+
 ```ts
 // lib/analytics.ts  ← create once, import anywhere
 import { createServerClient } from '@sparklytics/next/server'
 
 export const analytics = createServerClient()
-// No arguments — reads SPARKLYTICS_HOST and SPARKLYTICS_WEBSITE_ID automatically
 ```
 
-### `fromRequest(request)` — auto-extract all headers ✨
+### `fromRequest(request)` — auto-extract all headers
 
-In Route Handlers, call `fromRequest(request)` to automatically extract `url`, `userAgent`, `ip`, `referrer`, and `language` — no boilerplate:
+In Route Handlers, call `fromRequest(request)` to auto-extract `url`, `userAgent`, `ip`, `referrer`, and `language`:
 
 ```ts
 // app/api/checkout/route.ts
 import { analytics } from '@/lib/analytics'
 
 export async function POST(request: Request) {
-  const { cartValue } = await request.json()
+  const { cartValue } = await request.json() as { cartValue: number }
 
   // One line — url, userAgent, ip all auto-extracted from request
   await analytics.fromRequest(request).trackEvent({
@@ -380,14 +553,6 @@ export async function POST(request: Request) {
   })
 
   return Response.json({ ok: true })
-}
-```
-
-```ts
-// Pageview — zero options needed when all come from the request
-export async function GET(request: Request) {
-  await analytics.fromRequest(request).trackPageview()
-  // ...
 }
 ```
 
@@ -408,20 +573,34 @@ export async function completePurchase(cartValue: number) {
 }
 ```
 
-### Error handling
+### Server-side visitor stitching
 
-By default, `createServerClient` runs in **silent mode** — errors are logged via `console.warn` and never break your request handlers. Analytics should never crash your app.
-
-If you need errors to propagate (e.g. for debugging or when analytics reliability is critical), opt in to strict mode:
+Pass `visitorId` to stitch server-side events with a known user profile:
 
 ```ts
+import { createHash } from 'crypto'
+
+const visitorId = createHash('sha256').update(userId).digest('hex').slice(0, 16)
+await analytics.trackEvent({ url: '/dashboard', eventName: 'login', visitorId })
+```
+
+### Error handling
+
+By default, all server helpers run in **silent mode** — errors are logged via `console.warn` and never break your request handlers.
+
+```ts
+// Strict mode — errors propagate (useful for debugging)
 export const analytics = createServerClient({ silent: false })
-// Errors now reject the Promise — wrap calls in try/catch
+
+// Standalone helpers always throw — wrap in try/catch
+try {
+  await trackServerPageview({ host, websiteId, url: '/page' })
+} catch (err) {
+  // handle error
+}
 ```
 
 ### One-off helpers (no singleton)
-
-If you prefer to avoid a singleton, the standalone functions still work:
 
 ```ts
 import { trackServerPageview, trackServerEvent } from '@sparklytics/next/server'
@@ -437,17 +616,16 @@ await trackServerPageview({
 
 | Option | Type | Required | Description |
 |--------|------|----------|-------------|
-| `host` | `string` | ✅ (standalone) | Base URL of your Sparklytics server. Not needed on a `createServerClient()` client. |
-| `websiteId` | `string` | ✅ (standalone) | Website ID from your dashboard. Not needed on a `createServerClient()` client. |
+| `host` | `string` | ✅ (standalone) | Base URL of your Sparklytics server. |
+| `websiteId` | `string` | ✅ (standalone) | Website ID from your dashboard. |
 | `url` | `string` | ✅ | URL path to record (e.g. `"/checkout"`) |
-| `eventName` | `string` | ✅ (`trackEvent` / `trackServerEvent` only) | Event name, max 50 chars |
+| `eventName` | `string` | ✅ (`trackEvent` only) | Event name, max 50 chars |
 | `eventData` | `Record<string, unknown>` | — | Event payload, max 4 KB |
 | `referrer` | `string` | — | HTTP Referer from the incoming request |
 | `language` | `string` | — | Accept-Language header value |
 | `userAgent` | `string` | — | User-Agent for browser/OS/device detection |
 | `ip` | `string` | — | Client IP for geo-lookup (never stored) |
-
-> **Error handling:** `createServerClient` is silent by default — errors become `console.warn`. The standalone `trackServerPageview` / `trackServerEvent` helpers always throw on error. Use `silent: false` on the client if you need errors to propagate.
+| `visitorId` | `string` | — | Hashed user ID for cross-session stitching |
 
 > **Edge Runtime:** Both `createServerClient` and the standalone helpers use only global `fetch` and are safe in Edge Runtime Middleware.
 
@@ -637,12 +815,18 @@ The server package (`@sparklytics/next/server`) uses only global `fetch` and is 
 | Export | Type | Description |
 |--------|------|-------------|
 | `SparklyticsProvider` | Component | Root provider — mount once in your layout |
-| `useSparklytics` | Hook | Returns `{ track, pageview }` for custom events and manual pageviews |
-| `SparklyticsEvent` | Component | Declarative click tracker wrapping any element |
+| `useSparklytics` | Hook | Returns `{ track, pageview, identify, reset }` |
+| `usePageview` | Hook | Standalone Pages Router auto-tracking hook |
+| `Track` | Component | Declarative event tracker for any DOM trigger |
 | `TrackedLink` | Component | Next.js `<Link>` wrapper with automatic click tracking |
+| `identify` | Function | Set visitor ID for cross-session stitching — no hook needed |
+| `reset` | Function | Clear visitor ID on logout — no hook needed |
 | `SparklyticsEvents` | Interface | Augment to add typed event schemas |
 | `SparklyticsProviderProps` | Type | Props type for the provider |
 | `SparklyticsHook` | Type | Return type of `useSparklytics()` |
+| `UsePageviewOptions` | Type | Options for `usePageview()` |
+| `TrackProps` | Type | Props type for `<Track>` |
+| `TrackTrigger` | Type | Union of valid trigger DOM event names |
 | `TrackedLinkProps` | Type | Props type for `<TrackedLink>` |
 | `BatchEvent` | Type | Internal wire format (advanced use) |
 
@@ -650,15 +834,18 @@ The server package (`@sparklytics/next/server`) uses only global `fetch` and is 
 
 | Export | Type | Description |
 |--------|------|-------------|
+| `withAnalytics` | Function | Route Handler HOC — GET/HEAD auto-pageview + injected client |
+| `trackServerMiddleware` | Function | One-line middleware pageview tracker |
 | `createServerClient` | Function | Create a pre-configured client (recommended) |
 | `trackServerPageview` | Function | One-off pageview tracking |
 | `trackServerEvent` | Function | One-off custom event tracking |
 | `ServerClient` | Interface | Return type of `createServerClient` |
 | `BoundServerClient` | Interface | Return type of `ServerClient.fromRequest()` |
 | `ServerClientConfig` | Interface | Config for `createServerClient` |
+| `WithAnalyticsConfig` | Interface | Config for `withAnalytics` (extends `ServerClientConfig` + `pageview?`) |
 | `TrackServerPageviewOptions` | Type | Options for `trackServerPageview` |
 | `TrackServerEventOptions` | Type | Options for `trackServerEvent` |
-| `TrackServerBaseOptions` | Type | Shared base options |
+| `TrackServerBaseOptions` | Type | Shared base options (includes `visitorId`) |
 
 ---
 

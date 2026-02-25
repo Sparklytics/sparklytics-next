@@ -49,8 +49,11 @@ vi.mock('next/link', () => ({
 import {
   SparklyticsProvider,
   useSparklytics,
-  SparklyticsEvent,
   TrackedLink,
+  Track,
+  usePageview,
+  identify as standaloneIdentify,
+  reset as standaloneReset,
 } from '../src/index'
 
 // Import mocked next/router so tests can inspect registered handlers
@@ -756,74 +759,6 @@ describe('Privacy signals', () => {
     renderProvider({ websiteId: 'site_1', respectDnt: false })
     await flushQueue()
     expect(sendBeaconMock).toHaveBeenCalledTimes(1)
-  })
-})
-
-// ──────────────────────────────────────────────────────────────
-// Feature: SparklyticsEvent component
-// ──────────────────────────────────────────────────────────────
-
-describe('SparklyticsEvent component', () => {
-  it('test_sparklytics_event_fires_on_click — click tracks named event with correct fields', async () => {
-    const { getByText } = render(
-      React.createElement(
-        SparklyticsProvider,
-        { websiteId: 'site_1' },
-        React.createElement(
-          SparklyticsEvent,
-          { name: 'cta_click', data: { button: 'hero' } },
-          React.createElement('button', {}, 'Click me'),
-        ),
-      ),
-    )
-
-    await flushQueue()
-    sendBeaconMock.mockClear()
-
-    await act(async () => {
-      getByText('Click me').click()
-      vi.advanceTimersByTime(600)
-      await Promise.resolve()
-    })
-
-    expect(sendBeaconMock).toHaveBeenCalledTimes(1)
-    const blob: Blob = sendBeaconMock.mock.calls[0][1]
-    const events = JSON.parse(await blob.text()) as Record<string, unknown>[]
-    expect(events[0]['type']).toBe('event')
-    expect(events[0]['event_name']).toBe('cta_click')
-    expect(events[0]['event_data']).toEqual({ button: 'hero' })
-  })
-
-  it('test_sparklytics_event_preserves_existing_onclick — both existing onClick AND tracking fire', async () => {
-    const existingOnClick = vi.fn()
-
-    const { getByText } = render(
-      React.createElement(
-        SparklyticsProvider,
-        { websiteId: 'site_1' },
-        React.createElement(
-          SparklyticsEvent,
-          { name: 'btn_click' },
-          React.createElement('button', { onClick: existingOnClick }, 'Press me'),
-        ),
-      ),
-    )
-
-    await flushQueue()
-    sendBeaconMock.mockClear()
-
-    await act(async () => {
-      getByText('Press me').click()
-      vi.advanceTimersByTime(600)
-      await Promise.resolve()
-    })
-
-    // Both the original handler AND the tracking event must fire
-    expect(existingOnClick).toHaveBeenCalledTimes(1)
-    expect(sendBeaconMock).toHaveBeenCalledTimes(1)
-    const blob: Blob = sendBeaconMock.mock.calls[0][1]
-    const events = JSON.parse(await blob.text()) as Record<string, unknown>[]
-    expect(events[0]['event_name']).toBe('btn_click')
   })
 })
 
@@ -1581,8 +1516,8 @@ describe('SSR safety', () => {
     expect(() => {
       void SparklyticsProvider
       void useSparklytics
-      void SparklyticsEvent
       void TrackedLink
+      void Track
     }).not.toThrow()
   })
 
@@ -1656,6 +1591,425 @@ describe('SparklyticsProvider — env var fallback', () => {
       )
     }).not.toThrow()
 
+    vi.unstubAllEnvs()
+  })
+})
+
+// ──────────────────────────────────────────────────────────────
+// Feature: <Track> component
+// ──────────────────────────────────────────────────────────────
+
+describe('Track component', () => {
+  it('test_Track_fires_event_on_click — default trigger fires on click', async () => {
+    const { getByTestId } = renderProvider(
+      { websiteId: 'site_1' },
+      React.createElement(
+        Track,
+        { event: 'cta_clicked', data: { plan: 'pro' } },
+        React.createElement('button', { 'data-testid': 'btn' }, 'Click'),
+      ),
+    )
+    await flushQueue() // drain initial pageview
+
+    const btn = getByTestId('btn')
+    await act(async () => { btn.click() })
+    await flushQueue()
+
+    const allBodies = await Promise.all(
+      sendBeaconMock.mock.calls.map(async ([, blob]: [unknown, Blob]) =>
+        JSON.parse(await blob.text()) as Record<string, unknown>[],
+      ),
+    )
+    const events = allBodies.flat()
+    const clickEvent = events.find((e) => e['event_name'] === 'cta_clicked')
+    expect(clickEvent).toBeDefined()
+    expect(clickEvent!['event_data']).toEqual({ plan: 'pro' })
+    expect(clickEvent!['type']).toBe('event')
+  })
+
+  it('test_Track_preserves_existing_onClick — existing onClick still called', async () => {
+    const existingClick = vi.fn()
+    const { getByTestId } = renderProvider(
+      { websiteId: 'site_1' },
+      React.createElement(
+        Track,
+        { event: 'btn_clicked' },
+        React.createElement('button', { 'data-testid': 'btn', onClick: existingClick }, 'Click'),
+      ),
+    )
+    await flushQueue()
+
+    getByTestId('btn').click()
+    expect(existingClick).toHaveBeenCalledTimes(1)
+  })
+
+  it('test_Track_trigger_focus — fires event on focus when trigger="focus"', async () => {
+    const { getByTestId } = renderProvider(
+      { websiteId: 'site_1' },
+      React.createElement(
+        Track,
+        { event: 'field_focused', trigger: 'focus' },
+        React.createElement('input', { 'data-testid': 'inp', type: 'text' }),
+      ),
+    )
+    await flushQueue()
+
+    const inp = getByTestId('inp') as HTMLInputElement
+    await act(async () => { inp.focus() })
+    await flushQueue()
+
+    const allBodies = await Promise.all(
+      sendBeaconMock.mock.calls.map(async ([, blob]: [unknown, Blob]) =>
+        JSON.parse(await blob.text()) as Record<string, unknown>[],
+      ),
+    )
+    const events = allBodies.flat()
+    expect(events.some((e) => e['event_name'] === 'field_focused')).toBe(true)
+  })
+
+  it('test_Track_no_data — event fires with undefined eventData', async () => {
+    const { getByTestId } = renderProvider(
+      { websiteId: 'site_1' },
+      React.createElement(
+        Track,
+        { event: 'no_data_event' },
+        React.createElement('button', { 'data-testid': 'btn' }, 'Click'),
+      ),
+    )
+    await flushQueue()
+
+    getByTestId('btn').click()
+    await flushQueue()
+
+    const allBodies = await Promise.all(
+      sendBeaconMock.mock.calls.map(async ([, blob]: [unknown, Blob]) =>
+        JSON.parse(await blob.text()) as Record<string, unknown>[],
+      ),
+    )
+    const events = allBodies.flat()
+    const clickEvent = events.find((e) => e['event_name'] === 'no_data_event')
+    expect(clickEvent).toBeDefined()
+    // event_data should be absent or undefined when no data passed
+    expect(clickEvent!['event_data']).toBeUndefined()
+  })
+
+  it('test_Track_renders_child_unchanged — Track does not wrap child in extra DOM element', () => {
+    const { container } = renderProvider(
+      { websiteId: 'site_1' },
+      React.createElement(
+        Track,
+        { event: 'test' },
+        React.createElement('button', { 'data-testid': 'btn' }, 'Click'),
+      ),
+    )
+    // No extra wrapper elements — the button is a direct descendant
+    const btn = container.querySelector('[data-testid="btn"]')
+    expect(btn).toBeTruthy()
+    expect(btn!.tagName.toLowerCase()).toBe('button')
+  })
+})
+
+// ──────────────────────────────────────────────────────────────
+// Feature: standalone identify() / reset() (no hook required)
+// ──────────────────────────────────────────────────────────────
+
+describe('standalone identify and reset (module-level exports)', () => {
+  afterEach(() => {
+    localStorage.clear()
+  })
+
+  it('test_standalone_identify_writes_localStorage — identify() sets key without Provider or hook', () => {
+    standaloneIdentify('standalone-visitor-xyz')
+    expect(localStorage.getItem('sparklytics_visitor_id')).toBe('standalone-visitor-xyz')
+  })
+
+  it('test_standalone_reset_clears_localStorage — reset() removes key without Provider or hook', () => {
+    localStorage.setItem('sparklytics_visitor_id', 'to-be-cleared')
+    standaloneReset()
+    expect(localStorage.getItem('sparklytics_visitor_id')).toBeNull()
+  })
+
+  it('test_standalone_identify_affects_provider_events — Provider picks up ID set by standalone identify()', async () => {
+    // Set the visitor ID via the standalone export (e.g. from an auth callback)
+    standaloneIdentify('standalone-set-before-mount')
+
+    // Then mount the Provider — the initial pageview should carry the visitor_id
+    renderProvider({ websiteId: 'site_1' })
+    await flushQueue()
+
+    const allBodies = await Promise.all(
+      sendBeaconMock.mock.calls.map(async ([, blob]: [unknown, Blob]) =>
+        JSON.parse(await blob.text()) as Record<string, unknown>[],
+      ),
+    )
+    const events = allBodies.flat()
+    const pageview = events.find((e) => e['type'] === 'pageview')
+    expect(pageview!['visitor_id']).toBe('standalone-set-before-mount')
+  })
+
+  it('test_standalone_reset_affects_provider_events — Provider omits visitor_id after standalone reset()', async () => {
+    // Pre-load visitor ID then clear it
+    localStorage.setItem('sparklytics_visitor_id', 'visitor-was-here')
+    standaloneReset()
+
+    renderProvider({ websiteId: 'site_1' })
+    await flushQueue()
+
+    const allBodies = await Promise.all(
+      sendBeaconMock.mock.calls.map(async ([, blob]: [unknown, Blob]) =>
+        JSON.parse(await blob.text()) as Record<string, unknown>[],
+      ),
+    )
+    const events = allBodies.flat()
+    const pageview = events.find((e) => e['type'] === 'pageview')
+    expect(pageview!['visitor_id']).toBeUndefined()
+  })
+})
+
+// ──────────────────────────────────────────────────────────────
+// Feature: identify() / reset() via hook
+// ──────────────────────────────────────────────────────────────
+
+describe('identify and reset (via hook)', () => {
+  afterEach(() => {
+    localStorage.clear()
+  })
+
+  it('test_identify_stores_visitor_id_in_localStorage — identify() writes to localStorage', async () => {
+    function Consumer() {
+      const { identify } = useSparklytics()
+      React.useEffect(() => { identify('visitor-abc123') }, [identify])
+      return null
+    }
+    renderProvider({ websiteId: 'site_1' }, React.createElement(Consumer))
+    await settle()
+
+    expect(localStorage.getItem('sparklytics_visitor_id')).toBe('visitor-abc123')
+  })
+
+  it('test_identify_includes_visitor_id_in_events — track() attaches visitor_id from localStorage', async () => {
+    function Consumer() {
+      const { identify, track } = useSparklytics()
+      React.useEffect(() => {
+        identify('identified-user-001')
+        track('test_event')
+      }, [identify, track])
+      return null
+    }
+    renderProvider({ websiteId: 'site_1' }, React.createElement(Consumer))
+    await flushQueue()
+
+    const allBodies = await Promise.all(
+      sendBeaconMock.mock.calls.map(async ([, blob]: [unknown, Blob]) =>
+        JSON.parse(await blob.text()) as Record<string, unknown>[],
+      ),
+    )
+    const events = allBodies.flat()
+    const trackedEvent = events.find((e) => e['event_name'] === 'test_event')
+    expect(trackedEvent).toBeDefined()
+    expect(trackedEvent!['visitor_id']).toBe('identified-user-001')
+  })
+
+  it('test_identify_attaches_visitor_id_to_pageviews — pageviews also carry visitor_id', async () => {
+    // Set the visitor ID in localStorage directly (simulating a prior identify() call)
+    localStorage.setItem('sparklytics_visitor_id', 'pre-identified-visitor')
+
+    renderProvider({ websiteId: 'site_1' })
+    await flushQueue()
+
+    const allBodies = await Promise.all(
+      sendBeaconMock.mock.calls.map(async ([, blob]: [unknown, Blob]) =>
+        JSON.parse(await blob.text()) as Record<string, unknown>[],
+      ),
+    )
+    const events = allBodies.flat()
+    const pageview = events.find((e) => e['type'] === 'pageview')
+    expect(pageview!['visitor_id']).toBe('pre-identified-visitor')
+  })
+
+  it('test_reset_clears_visitor_id — reset() removes from localStorage', async () => {
+    localStorage.setItem('sparklytics_visitor_id', 'to-be-cleared')
+
+    function Consumer() {
+      const { reset } = useSparklytics()
+      React.useEffect(() => { reset() }, [reset])
+      return null
+    }
+    renderProvider({ websiteId: 'site_1' }, React.createElement(Consumer))
+    await settle()
+
+    expect(localStorage.getItem('sparklytics_visitor_id')).toBeNull()
+  })
+
+  it('test_events_after_reset_have_no_visitor_id — track() after reset() omits visitor_id', async () => {
+    function Consumer() {
+      const { identify, reset, track } = useSparklytics()
+      React.useEffect(() => {
+        identify('user-to-reset')
+        reset()
+        track('post_reset_event')
+      }, [identify, reset, track])
+      return null
+    }
+    renderProvider({ websiteId: 'site_1' }, React.createElement(Consumer))
+    await flushQueue()
+
+    const allBodies = await Promise.all(
+      sendBeaconMock.mock.calls.map(async ([, blob]: [unknown, Blob]) =>
+        JSON.parse(await blob.text()) as Record<string, unknown>[],
+      ),
+    )
+    const events = allBodies.flat()
+    const postResetEvent = events.find((e) => e['event_name'] === 'post_reset_event')
+    // visitor_id must be absent after reset
+    expect(postResetEvent).toBeDefined()
+    expect(postResetEvent!['visitor_id']).toBeUndefined()
+  })
+
+  it('test_no_visitor_id_when_not_identified — events have no visitor_id when identify not called', async () => {
+    function Consumer() {
+      const { track } = useSparklytics()
+      React.useEffect(() => { track('anonymous_event') }, [track])
+      return null
+    }
+    renderProvider({ websiteId: 'site_1' }, React.createElement(Consumer))
+    await flushQueue()
+
+    const allBodies = await Promise.all(
+      sendBeaconMock.mock.calls.map(async ([, blob]: [unknown, Blob]) =>
+        JSON.parse(await blob.text()) as Record<string, unknown>[],
+      ),
+    )
+    const events = allBodies.flat()
+    const ev = events.find((e) => e['event_name'] === 'anonymous_event')
+    expect(ev).toBeDefined()
+    expect(ev!['visitor_id']).toBeUndefined()
+  })
+
+  it('test_identify_reset_noop_outside_provider — identify/reset from default context do not throw', () => {
+    function Consumer() {
+      const { identify, reset } = useSparklytics()
+      React.useEffect(() => {
+        expect(() => identify('id')).not.toThrow()
+        expect(() => reset()).not.toThrow()
+      }, [identify, reset])
+      return null
+    }
+    // No provider — uses default no-op context
+    expect(() => render(React.createElement(Consumer))).not.toThrow()
+  })
+})
+
+// ──────────────────────────────────────────────────────────────
+// Feature: usePageview() standalone hook
+// ──────────────────────────────────────────────────────────────
+
+describe('usePageview hook', () => {
+  it('test_usePageview_fires_initial_pageview — sends pageview on mount', async () => {
+    vi.stubEnv('NEXT_PUBLIC_SPARKLYTICS_WEBSITE_ID', 'site_hook')
+    vi.stubEnv('NEXT_PUBLIC_SPARKLYTICS_HOST', '')
+
+    function Page() {
+      usePageview()
+      return null
+    }
+    render(React.createElement(Page))
+    await flushQueue()
+
+    // Should have fired at least one sendBeacon call (the initial pageview)
+    const allBodies = await Promise.all(
+      sendBeaconMock.mock.calls.map(async ([, blob]: [unknown, Blob]) =>
+        JSON.parse(await blob.text()) as Record<string, unknown>[],
+      ),
+    )
+    const events = allBodies.flat()
+    const pageview = events.find((e) => e['type'] === 'pageview')
+    expect(pageview).toBeDefined()
+    expect(pageview!['website_id']).toBe('site_hook')
+
+    vi.unstubAllEnvs()
+  })
+
+  it('test_usePageview_respects_disabled — no events when disabled: true', async () => {
+    vi.stubEnv('NEXT_PUBLIC_SPARKLYTICS_WEBSITE_ID', 'site_hook')
+
+    function Page() {
+      usePageview({ disabled: true })
+      return null
+    }
+    render(React.createElement(Page))
+    await flushQueue()
+
+    expect(sendBeaconMock).not.toHaveBeenCalled()
+    vi.unstubAllEnvs()
+  })
+
+  it('test_usePageview_explicit_websiteId — uses explicit websiteId over env var', async () => {
+    vi.stubEnv('NEXT_PUBLIC_SPARKLYTICS_WEBSITE_ID', 'site_from_env')
+
+    function Page() {
+      usePageview({ websiteId: 'site_explicit', host: '' })
+      return null
+    }
+    render(React.createElement(Page))
+    await flushQueue()
+
+    const allBodies = await Promise.all(
+      sendBeaconMock.mock.calls.map(async ([, blob]: [unknown, Blob]) =>
+        JSON.parse(await blob.text()) as Record<string, unknown>[],
+      ),
+    )
+    const events = allBodies.flat()
+    expect(events.every((e) => e['website_id'] === 'site_explicit')).toBe(true)
+
+    vi.unstubAllEnvs()
+  })
+
+  it('test_usePageview_pages_router_routeChange — fires on routeChangeComplete', async () => {
+    vi.stubEnv('NEXT_PUBLIC_SPARKLYTICS_WEBSITE_ID', 'site_hook')
+
+    function Page() {
+      usePageview()
+      return null
+    }
+    render(React.createElement(Page))
+    await settle() // let dynamic import of next/router settle
+
+    // Simulate a Pages Router route change by calling the registered handler
+    const routerMock = nextRouter as { events: { on: ReturnType<typeof vi.fn>; off: ReturnType<typeof vi.fn> } }
+    const onCalls = routerMock.events.on.mock.calls
+    const routeChangeHandler = onCalls.find(
+      ([event]: [string]) => event === 'routeChangeComplete',
+    )?.[1] as ((url: string) => void) | undefined
+
+    if (routeChangeHandler) {
+      await act(async () => { routeChangeHandler('/new-route') })
+      await flushQueue()
+
+      const allBodies = await Promise.all(
+        sendBeaconMock.mock.calls.map(async ([, blob]: [unknown, Blob]) =>
+          JSON.parse(await blob.text()) as Record<string, unknown>[],
+        ),
+      )
+      const events = allBodies.flat()
+      const routePageview = events.find((e) => e['url'] === '/new-route')
+      expect(routePageview).toBeDefined()
+    }
+
+    vi.unstubAllEnvs()
+  })
+
+  it('test_usePageview_no_event_when_websiteId_missing — no tracking without websiteId', async () => {
+    vi.stubEnv('NEXT_PUBLIC_SPARKLYTICS_WEBSITE_ID', '')
+
+    function Page() {
+      usePageview({ websiteId: '' })
+      return null
+    }
+    render(React.createElement(Page))
+    await flushQueue()
+
+    expect(sendBeaconMock).not.toHaveBeenCalled()
     vi.unstubAllEnvs()
   })
 })

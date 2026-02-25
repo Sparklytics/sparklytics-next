@@ -11,7 +11,37 @@
  *
  * ---
  *
- * ## Recommended pattern: zero-config `createServerClient()`
+ * ## Recommended patterns
+ *
+ * ### `withAnalytics` — Route Handler HOC (least boilerplate)
+ *
+ * Wraps a Route Handler, auto-tracks a pageview, and injects a bound analytics
+ * client — all in one line:
+ *
+ * ```ts
+ * // app/api/checkout/route.ts
+ * import { withAnalytics } from '@sparklytics/next/server'
+ *
+ * export const POST = withAnalytics(async (request, analytics) => {
+ *   await analytics.trackEvent({ eventName: 'purchase', eventData: { amount: 49.99 } })
+ *   return Response.json({ ok: true })
+ * })
+ * ```
+ *
+ * ### `trackServerMiddleware` — one-liner for `middleware.ts`
+ *
+ * ```ts
+ * // middleware.ts
+ * import { trackServerMiddleware } from '@sparklytics/next/server'
+ * import { NextResponse } from 'next/server'
+ *
+ * export async function middleware(request: Request) {
+ *   await trackServerMiddleware(request)   // pageview auto-tracked
+ *   return NextResponse.next()
+ * }
+ * ```
+ *
+ * ### Zero-config `createServerClient()`
  *
  * Set two env vars, create a client once, import it anywhere — zero per-call
  * configuration needed.
@@ -137,6 +167,26 @@ export interface TrackServerBaseOptions {
    * the IP from your hosting platform's request context.
    */
   ip?: string
+
+  /**
+   * Optional visitor ID for cross-session stitching.
+   *
+   * When provided, sent as `visitor_id` in the collect payload so the backend
+   * uses this stable identifier instead of computing one from IP + User-Agent.
+   * Enables you to connect anonymous visits with logged-in user analytics.
+   *
+   * **Privacy note:** pass a hashed or tokenised identifier — never a raw email
+   * address or numeric user ID. A good default is `sha256(userId).slice(0, 16)`.
+   *
+   * @example
+   * ```ts
+   * import { createHash } from 'crypto'
+   *
+   * const visitorId = createHash('sha256').update(userId).digest('hex').slice(0, 16)
+   * await analytics.trackEvent({ url: '/dashboard', eventName: 'login', visitorId })
+   * ```
+   */
+  visitorId?: string
 }
 
 // ============================================================
@@ -423,6 +473,164 @@ export function createServerClient(config?: ServerClientConfig): ServerClient {
 }
 
 // ============================================================
+// withAnalytics — Route Handler HOC
+// ============================================================
+
+/**
+ * Configuration for `withAnalytics`. Extends {@link ServerClientConfig} with
+ * HOC-specific options.
+ */
+export interface WithAnalyticsConfig extends ServerClientConfig {
+  /**
+   * Whether to automatically track a pageview before calling the handler.
+   *
+   * Defaults to `true` for GET and HEAD requests, and `false` for all other
+   * HTTP methods (POST, PUT, PATCH, DELETE, etc.), following HTTP semantics
+   * where GET = page view and mutation verbs = API actions.
+   *
+   * Override explicitly when needed:
+   * - `pageview: true`  — always track (e.g. a POST that renders a page response)
+   * - `pageview: false` — never track (e.g. a GET that is a pure data API)
+   */
+  pageview?: boolean
+}
+
+/**
+ * Higher-order function that wraps a Next.js Route Handler, injects a
+ * pre-bound {@link BoundServerClient}, and automatically tracks a pageview
+ * for GET and HEAD requests (following HTTP semantics — mutation verbs such as
+ * POST/PUT/DELETE are API actions, not page views).
+ *
+ * Uses `createServerClient(config)` under the hood, so it reads
+ * `SPARKLYTICS_HOST` and `SPARKLYTICS_WEBSITE_ID` from environment variables
+ * when no config is supplied.
+ *
+ * @example GET handler — auto-tracks pageview, injects analytics client
+ * ```ts
+ * // app/products/route.ts
+ * import { withAnalytics } from '@sparklytics/next/server'
+ *
+ * export const GET = withAnalytics(async (request, analytics) => {
+ *   return Response.json({ products: [] })
+ * })
+ * ```
+ *
+ * @example POST handler — no auto-pageview; track custom event instead
+ * ```ts
+ * // app/api/checkout/route.ts
+ * import { withAnalytics } from '@sparklytics/next/server'
+ *
+ * export const POST = withAnalytics(async (request, analytics) => {
+ *   const { amount } = await request.json() as { amount: number }
+ *   await analytics.trackEvent({ eventName: 'purchase', eventData: { amount } })
+ *   return Response.json({ ok: true })
+ * })
+ * ```
+ *
+ * @example Dynamic route with params
+ * ```ts
+ * // app/api/orders/[id]/route.ts
+ * import { withAnalytics } from '@sparklytics/next/server'
+ *
+ * export const GET = withAnalytics(async (request, analytics, context) => {
+ *   const { id } = await (context as { params: Promise<{ id: string }> }).params
+ *   await analytics.trackEvent({ eventName: 'order_viewed', eventData: { id } })
+ *   return Response.json({ id })
+ * })
+ * ```
+ *
+ * @param handler - Your Route Handler function, receiving `(request, analytics, context?)`.
+ * @param config  - Optional {@link WithAnalyticsConfig} for host, websiteId, silent mode, and pageview control.
+ * @returns       A standard Next.js Route Handler `(request, context?) => Promise<Response>`.
+ */
+export function withAnalytics<TContext = unknown>(
+  handler: (
+    request: Request,
+    analytics: BoundServerClient,
+    context?: TContext,
+  ) => Response | Promise<Response>,
+  config?: WithAnalyticsConfig,
+): (request: Request, context?: TContext) => Promise<Response> {
+  const client = createServerClient(config)
+
+  return async (request: Request, context?: TContext): Promise<Response> => {
+    const bound = client.fromRequest(request)
+
+    // Auto-track a pageview for GET/HEAD (page views) but not for mutation
+    // verbs (POST, PUT, PATCH, DELETE) which are API actions, not page views.
+    // Set `pageview: true/false` in config to override the default.
+    const shouldTrackPageview =
+      config?.pageview ?? (request.method === 'GET' || request.method === 'HEAD')
+
+    if (shouldTrackPageview) {
+      await bound.trackPageview()
+    }
+
+    return handler(request, bound, context)
+  }
+}
+
+// ============================================================
+// trackServerMiddleware — middleware.ts helper
+// ============================================================
+
+/**
+ * Track a pageview from Next.js middleware with a single line.
+ *
+ * Reads `SPARKLYTICS_HOST` and `SPARKLYTICS_WEBSITE_ID` from environment
+ * variables automatically (same as zero-config `createServerClient()`).
+ * Errors are **silent by default** so a tracking failure never breaks routing.
+ *
+ * The `url`, `userAgent`, `ip`, and `language` are automatically extracted
+ * from the request headers — no manual extraction needed.
+ *
+ * @example Basic middleware tracking
+ * ```ts
+ * // middleware.ts
+ * import { trackServerMiddleware } from '@sparklytics/next/server'
+ * import { NextResponse } from 'next/server'
+ *
+ * export async function middleware(request: Request) {
+ *   await trackServerMiddleware(request)
+ *   return NextResponse.next()
+ * }
+ *
+ * export const config = { matcher: ['/((?!_next|api).*)'] }
+ * ```
+ *
+ * @example With a custom URL override
+ * ```ts
+ * await trackServerMiddleware(request, { url: '/custom-virtual-path' })
+ * ```
+ *
+ * @example Strict mode — let errors propagate
+ * ```ts
+ * await trackServerMiddleware(request, { silent: false })
+ * ```
+ *
+ * @param request - The incoming `Request` (or `NextRequest`).
+ * @param options - Optional overrides for any {@link TrackServerPageviewOptions} field
+ *                  plus a `silent` flag (default `true`).
+ */
+export async function trackServerMiddleware(
+  request: Request,
+  options?: Partial<Omit<TrackServerPageviewOptions, 'host' | 'websiteId'>> & {
+    /**
+     * When `true` (the default), tracking errors are swallowed as `console.warn`.
+     * Set to `false` to make errors propagate — useful when analytics reliability
+     * is critical or for debugging.
+     *
+     * @default true
+     */
+    silent?: boolean
+  },
+): Promise<void> {
+  const { silent, ...pageviewOptions } = options ?? {}
+  const client = createServerClient({ silent: silent ?? true })
+  await client.fromRequest(request).trackPageview(pageviewOptions)
+}
+
+// ============================================================
 // Internal: shared POST logic
 // ============================================================
 
@@ -443,6 +651,7 @@ async function _send(
     url: base.url,
     ...(base.referrer ? { referrer: base.referrer } : {}),
     ...(base.language ? { language: base.language } : {}),
+    ...(base.visitorId ? { visitor_id: base.visitorId } : {}),
     ...fields,
   }
 

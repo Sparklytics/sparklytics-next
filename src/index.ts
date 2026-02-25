@@ -126,6 +126,47 @@ export interface SparklyticsHook {
    * ```
    */
   pageview(url?: string): void
+  /**
+   * Identify the current visitor with a stable ID for cross-session stitching.
+   *
+   * Equivalent to the standalone `identify()` export — both write to the same
+   * `localStorage` key. Prefer the standalone import when you don't already
+   * have a `useSparklytics()` call in scope (e.g. in an auth callback).
+   *
+   * **Privacy note:** pass a hashed or tokenised ID — **never** a raw email
+   * address or numeric user ID.
+   *
+   * @param visitorId - A stable, non-reversible identifier (max 64 chars).
+   *
+   * @example Via hook (inside a component)
+   * ```ts
+   * const { identify } = useSparklytics()
+   * identify(hashedUserId)
+   * ```
+   * @example Via standalone import (outside a component — preferred)
+   * ```ts
+   * import { identify } from '@sparklytics/next'
+   * identify(hashedUserId)
+   * ```
+   */
+  identify(visitorId: string): void
+  /**
+   * Clear the identified visitor ID from `localStorage`.
+   *
+   * Equivalent to the standalone `reset()` export. Call this on logout.
+   *
+   * @example Via hook (inside a component)
+   * ```ts
+   * const { reset } = useSparklytics()
+   * reset()
+   * ```
+   * @example Via standalone import (outside a component — preferred)
+   * ```ts
+   * import { reset } from '@sparklytics/next'
+   * reset()
+   * ```
+   */
+  reset(): void
 }
 
 // ============================================================
@@ -159,6 +200,11 @@ export interface BatchEvent {
   utm_content?: string
   event_name?: string
   event_data?: Record<string, unknown>
+  /**
+   * Optional stable visitor ID set via {@link SparklyticsHook.identify}.
+   * When present, the backend uses this instead of computing from IP + User-Agent.
+   */
+  visitor_id?: string
 }
 
 /**
@@ -233,12 +279,107 @@ function isPrivacyBlocked(respectDnt: boolean): boolean {
 }
 
 // ============================================================
+// Visitor identification (identify / reset)
+// ============================================================
+
+/** localStorage key for the identify() visitor ID override. */
+const IDENTIFY_KEY = 'sparklytics_visitor_id'
+
+/**
+ * Read the currently identified visitor ID from localStorage.
+ * Returns undefined when localStorage is unavailable or no ID is set.
+ */
+function getIdentifiedVisitor(): string | undefined {
+  try {
+    return localStorage.getItem(IDENTIFY_KEY) ?? undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Internal: write visitor ID to localStorage. Fail-silent. */
+function _setVisitorId(id: string): void {
+  try {
+    localStorage.setItem(IDENTIFY_KEY, id)
+  } catch {
+    // Storage unavailable (private browsing, quota exceeded) — fail silently
+  }
+}
+
+/** Internal: remove visitor ID from localStorage. Fail-silent. */
+function _clearVisitorId(): void {
+  try {
+    localStorage.removeItem(IDENTIFY_KEY)
+  } catch {
+    // Storage unavailable — fail silently
+  }
+}
+
+// ============================================================
+// Standalone visitor identification exports
+//
+// These work WITHOUT a React Provider — import and call them
+// directly in auth callbacks, Pages Router _app.tsx, or any
+// non-component code.
+// ============================================================
+
+/**
+ * Identify the current visitor with a stable ID for cross-session stitching.
+ *
+ * Stores the ID in `localStorage` and attaches it as `visitor_id` to all
+ * subsequent tracking calls (from `<SparklyticsProvider>`, `usePageview()`,
+ * or any other SDK call on this device). Works without React context —
+ * call it directly after login, no Provider or hook needed.
+ *
+ * **Privacy note:** pass a hashed or tokenised ID — **never** a raw email
+ * address or numeric user ID.
+ *
+ * @param visitorId - A stable, non-reversible identifier (max 64 chars).
+ *
+ * @example After login (no hook required)
+ * ```ts
+ * import { identify } from '@sparklytics/next'
+ *
+ * async function onLoginSuccess(userId: string) {
+ *   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(userId))
+ *   const hex = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('')
+ *   identify(hex.slice(0, 16))
+ * }
+ * ```
+ */
+export function identify(visitorId: string): void {
+  _setVisitorId(visitorId)
+}
+
+/**
+ * Clear the identified visitor ID from `localStorage`.
+ *
+ * Call this on logout so subsequent visits are no longer stitched to the
+ * logged-in user's profile. Works without React context — no Provider or
+ * hook needed.
+ *
+ * @example On logout (no hook required)
+ * ```ts
+ * import { reset } from '@sparklytics/next'
+ *
+ * function onLogout() {
+ *   reset()
+ * }
+ * ```
+ */
+export function reset(): void {
+  _clearVisitorId()
+}
+
+// ============================================================
 // Context — default is a no-op (safe for SSR / Server Components)
 // ============================================================
 
 const SparklyticsContext = createContext<SparklyticsHook>({
   track: () => {},
   pageview: () => {},
+  identify: () => {},
+  reset: () => {},
 })
 
 // ============================================================
@@ -375,7 +516,14 @@ export function SparklyticsProvider({
       lastPageviewRef.current = { url: event.url, ts: now }
     }
 
-    queueRef.current.push(event)
+    // Enrich with the identified visitor ID, if one has been set via identify().
+    const visitorId =
+      typeof window !== 'undefined' ? getIdentifiedVisitor() : undefined
+    const enriched: BatchEvent = visitorId
+      ? { ...event, visitor_id: visitorId }
+      : event
+
+    queueRef.current.push(enriched)
 
     // Flush immediately if batch reaches 10 events
     if (queueRef.current.length >= 10) {
@@ -629,9 +777,15 @@ export function SparklyticsProvider({
     })
   }
 
+  // Hook context versions — delegate to the module-level standalone functions
+  // so that useSparklytics().identify() and the imported identify() share
+  // exactly the same localStorage implementation.
+  const identifyCtx = (visitorId: string): void => _setVisitorId(visitorId)
+  const resetCtx = (): void => _clearVisitorId()
+
   return React.createElement(
     SparklyticsContext.Provider,
-    { value: { track, pageview } },
+    { value: { track, pageview, identify: identifyCtx, reset: resetCtx } },
     React.createElement(AppRouterTracker, {
       // enqueue() reads blockedRef.current internally, so no need to pass disabled here.
       onNavigate: (url: string) => {
@@ -705,34 +859,6 @@ export function useSparklytics(): SparklyticsHook {
 }
 
 // ============================================================
-// SparklyticsEvent — declarative click tracker
-// ============================================================
-
-export interface SparklyticsEventProps {
-  /** Event name to track on click. Max 50 chars. */
-  name: string
-  /** Optional event payload. Max 4KB JSON-serialized. */
-  data?: Record<string, unknown>
-  /** Must be a single React element. */
-  children: React.ReactElement
-}
-
-export function SparklyticsEvent({ name, data, children }: SparklyticsEventProps) {
-  const { track } = useSparklytics()
-  const child = React.Children.only(children)
-
-  return React.cloneElement(child, {
-    onClick: (e: React.MouseEvent) => {
-      track(name, data)
-      // Preserve the child's existing onClick if present
-      if (typeof child.props.onClick === 'function') {
-        child.props.onClick(e)
-      }
-    },
-  } as React.HTMLAttributes<HTMLElement>)
-}
-
-// ============================================================
 // TrackedLink — Next.js <Link> wrapper with automatic click tracking
 //
 // Drop-in replacement for next/link's <Link>. Fires a Sparklytics
@@ -760,6 +886,247 @@ export interface TrackedLinkProps extends React.ComponentPropsWithoutRef<typeof 
    */
   eventData?: Record<string, unknown>
 }
+
+// ============================================================
+// Track — declarative event tracker (JSX wrapper)
+// ============================================================
+
+/** DOM events that `<Track>` can listen to. */
+export type TrackTrigger = 'click' | 'focus' | 'blur' | 'mouseenter' | 'mouseleave' | 'submit'
+
+export interface TrackProps {
+  /**
+   * Sparklytics event name fired when the trigger fires.
+   * Max 50 chars.
+   */
+  event: string
+  /**
+   * Optional event payload. Max 4 KB JSON-serialized.
+   */
+  data?: Record<string, unknown>
+  /**
+   * DOM event that triggers analytics tracking.
+   *
+   * - `'click'`      — button clicks, link clicks (default)
+   * - `'focus'`      — input focus (form field reached)
+   * - `'blur'`       — input blur (user left the field)
+   * - `'mouseenter'` — cursor entered the element (hover start)
+   * - `'mouseleave'` — cursor left the element (hover end)
+   * - `'submit'`     — form submission
+   *
+   * @default 'click'
+   */
+  trigger?: TrackTrigger
+  /**
+   * Must be a single React element. The chosen event handler is injected
+   * without replacing any existing handler on the child.
+   */
+  children: React.ReactElement
+}
+
+/** Map from `TrackTrigger` to the React synthetic event handler prop name. */
+const TRIGGER_HANDLER: Record<TrackTrigger, string> = {
+  click:      'onClick',
+  focus:      'onFocus',
+  blur:       'onBlur',
+  mouseenter: 'onMouseEnter',
+  mouseleave: 'onMouseLeave',
+  submit:     'onSubmit',
+}
+
+/**
+ * Declarative wrapper that fires a Sparklytics event when any DOM interaction
+ * occurs on its child element — no `useSparklytics()` call required.
+ *
+ * Works with any element type. Existing event handlers on the child are
+ * preserved and called after tracking.
+ *
+ * @example Click tracking (default)
+ * ```tsx
+ * <Track event="cta_clicked" data={{ plan: 'pro' }}>
+ *   <button>Start free trial</button>
+ * </Track>
+ * ```
+ *
+ * @example Hover tracking
+ * ```tsx
+ * <Track event="pricing_hovered" trigger="mouseenter">
+ *   <div className="pricing-card">...</div>
+ * </Track>
+ * ```
+ *
+ * @example Form focus tracking
+ * ```tsx
+ * <Track event="email_field_focused" trigger="focus">
+ *   <input type="email" placeholder="you@example.com" />
+ * </Track>
+ * ```
+ */
+export function Track({ event: eventName, data, trigger = 'click', children }: TrackProps) {
+  const { track } = useSparklytics()
+  const child = React.Children.only(children)
+  const handlerKey = TRIGGER_HANDLER[trigger]
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any
+  const existing = (child.props as any)[handlerKey]
+
+  return React.cloneElement(child, {
+    [handlerKey]: (e: React.SyntheticEvent) => {
+      track(eventName, data)
+      if (typeof existing === 'function') existing(e)
+    },
+  } as Record<string, unknown>)
+}
+
+// ============================================================
+// usePageview — standalone Pages Router hook
+// ============================================================
+
+export interface UsePageviewOptions {
+  /**
+   * Website ID from your Sparklytics dashboard.
+   * Falls back to `NEXT_PUBLIC_SPARKLYTICS_WEBSITE_ID` when omitted.
+   */
+  websiteId?: string
+  /**
+   * Base URL of your Sparklytics server.
+   * Falls back to `NEXT_PUBLIC_SPARKLYTICS_HOST` when omitted.
+   * Omit for same-origin setups.
+   */
+  host?: string
+  /**
+   * Disable all tracking (e.g. for dev/staging).
+   * @default false
+   */
+  disabled?: boolean
+  /**
+   * Respect DNT and GPC privacy signals.
+   * @default true
+   */
+  respectDnt?: boolean
+}
+
+/**
+ * Standalone hook for automatic pageview tracking in **Pages Router** apps.
+ *
+ * Call once in `pages/_app.tsx` — it wires up:
+ * - **Initial pageview** on mount
+ * - **Route changes** via `next/router` `routeChangeComplete`
+ * - **Back/forward navigation** via `popstate`
+ *
+ * Reads `NEXT_PUBLIC_SPARKLYTICS_WEBSITE_ID` and `NEXT_PUBLIC_SPARKLYTICS_HOST`
+ * from env vars automatically when no options are passed.
+ *
+ * For **App Router**, use `<SparklyticsProvider>` instead — it handles routing
+ * automatically via `usePathname()`.
+ *
+ * @example Zero-config (recommended for most apps)
+ * ```tsx
+ * // pages/_app.tsx
+ * import type { AppProps } from 'next/app'
+ * import { usePageview } from '@sparklytics/next'
+ *
+ * export default function App({ Component, pageProps }: AppProps) {
+ *   usePageview()
+ *   return <Component {...pageProps} />
+ * }
+ * ```
+ *
+ * @example With explicit options
+ * ```tsx
+ * usePageview({
+ *   websiteId: 'site_abc123',
+ *   host: 'https://analytics.example.com',
+ *   respectDnt: true,
+ * })
+ * ```
+ */
+export function usePageview(options?: UsePageviewOptions): void {
+  useEffect(() => {
+    const websiteId =
+      options?.websiteId ??
+      (typeof process !== 'undefined'
+        ? process.env.NEXT_PUBLIC_SPARKLYTICS_WEBSITE_ID ?? ''
+        : '')
+    const host =
+      options?.host ??
+      (typeof process !== 'undefined'
+        ? process.env.NEXT_PUBLIC_SPARKLYTICS_HOST ?? ''
+        : '')
+
+    if (!websiteId || options?.disabled) return
+    if (options?.respectDnt !== false && isPrivacyBlocked(true)) return
+
+    const collectUrl = host
+      ? `${host.replace(/\/$/, '')}/api/collect`
+      : '/api/collect'
+
+    const sendPageview = (url: string): void => {
+      if (typeof navigator === 'undefined') return
+
+      const event: BatchEvent = {
+        website_id: websiteId,
+        type: 'pageview',
+        url,
+        ...getPageviewExtras(),
+      }
+
+      // Attach identified visitor ID if set
+      const visitorId = getIdentifiedVisitor()
+      if (visitorId) event.visitor_id = visitorId
+
+      const body = JSON.stringify([event])
+      try {
+        if (navigator.sendBeacon) {
+          navigator.sendBeacon(
+            collectUrl,
+            new Blob([body], { type: 'application/json' }),
+          )
+        } else {
+          void fetch(collectUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body,
+            keepalive: true,
+          }).catch(() => {
+            // Fire-and-forget — never throw on the host page
+          })
+        }
+      } catch {
+        // Never throw
+      }
+    }
+
+    // Initial pageview
+    sendPageview(window.location.pathname)
+
+    // Pages Router route changes
+    let pagesRouterCleanup: (() => void) | null = null
+    import('next/router')
+      .then((mod) => {
+        const router = mod.default
+        const handle = (url: string) => sendPageview(url)
+        router.events?.on('routeChangeComplete', handle)
+        pagesRouterCleanup = () => router.events?.off('routeChangeComplete', handle)
+      })
+      .catch(() => {
+        // App Router — next/router not in use; ignore
+      })
+
+    // Back/forward navigation
+    const handlePopState = () => sendPageview(window.location.pathname)
+    window.addEventListener('popstate', handlePopState)
+
+    return () => {
+      window.removeEventListener('popstate', handlePopState)
+      pagesRouterCleanup?.()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+}
+
+// ============================================================
+// TrackedLink — Next.js <Link> wrapper
+// ============================================================
 
 /**
  * Next.js-aware `<Link>` wrapper that fires a Sparklytics event on every click.
